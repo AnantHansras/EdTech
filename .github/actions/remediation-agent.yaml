@@ -1,0 +1,26 @@
+name: 'Remediation Agent'
+description: 'Downloads raw Dependabot alerts, groups them by component, and produces a ranked remediation-plan.json using a severity-weighted scoring model.'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Download raw alerts artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: dependabot-raw
+        path: .
+
+    - name: Build remediation plan
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 "${{ github.action_path }}/build_remediation_plan.py" \
+          "$PWD/dependabot-raw.json" \
+          "$PWD/remediation-plan.json"
+
+    - name: Upload remediation plan artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: remediation-plan
+        path: remediation-plan.json
+        retention-days: 14
