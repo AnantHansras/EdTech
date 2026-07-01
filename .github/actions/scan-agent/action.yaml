@@ -1,0 +1,133 @@
+name: 'Scan Agent'
+description: 'Fetches all Dependabot alerts for the repository, writes a Job Summary table, and uploads raw data artifacts for downstream jobs.'
+
+inputs:
+  github-token:
+    description: 'Token used to call the GitHub REST API. Needs security_events:read (or contents+security_events for private repos).'
+    required: true
+    default: ${{ github.token }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Fetch Dependabot alerts (paginated)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        echo "Fetching Dependabot alerts for ${REPO}..."
+
+        : > raw_alerts.jsonl
+        gh api \
+          --paginate \
+          -H "Accept: application/vnd.github+json" \
+          "/repos/${REPO}/dependabot/alerts?state=open&per_page=100" \
+          --jq '.[]' >> raw_alerts.jsonl || true
+
+        echo "Raw page lines fetched: $(wc -l < raw_alerts.jsonl)"
+
+    - name: Assemble raw JSON array
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - "$PWD/raw_alerts.jsonl" "$PWD/dependabot-raw.json" <<'PYEOF'
+        import json
+        import sys
+
+        src, dst = sys.argv[1], sys.argv[2]
+        alerts = []
+
+        try:
+            with open(src, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        alerts.append(json.loads(line))
+        except FileNotFoundError:
+            pass
+
+        with open(dst, "w") as f:
+            json.dump(alerts, f, indent=2)
+
+        print(f"Collected {len(alerts)} alert(s) into {dst}")
+        PYEOF
+
+    - name: Generate Job Summary table
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - "$PWD/dependabot-raw.json" "$PWD/scan-summary.md" <<'PYEOF'
+        import json
+        import sys
+
+        src, dst = sys.argv[1], sys.argv[2]
+
+        with open(src) as f:
+            alerts = json.load(f)
+
+        SEV_EMOJI = {
+            "critical": "🔴 Critical",
+            "high": "🟠 High",
+            "medium": "🟡 Medium",
+            "low": "🟢 Low",
+        }
+
+        lines = []
+        lines.append("## 🔍 Scan Agent — Dependabot Alert Report")
+        lines.append("")
+        lines.append(f"**Total open alerts found:** {len(alerts)}")
+        lines.append("")
+
+        if not alerts:
+            lines.append("_No open Dependabot alerts were found for this repository._")
+        else:
+            lines.append("| Dependency | Severity | CVSS Score | CVE / GHSA ID | State | Created At |")
+            lines.append("|---|---|---|---|---|---|")
+
+            def sort_key(a):
+                sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+                sev = (a.get("security_vulnerability") or {}).get("severity", "").lower()
+                return sev_rank.get(sev, 4)
+
+            for alert in sorted(alerts, key=sort_key):
+                dep = (alert.get("dependency") or {}).get("package", {}).get("name", "unknown")
+                sev_raw = (alert.get("security_vulnerability") or {}).get("severity", "unknown").lower()
+                sev = SEV_EMOJI.get(sev_raw, sev_raw.title() or "Unknown")
+
+                advisory = alert.get("security_advisory") or {}
+                cvss = advisory.get("cvss") or {}
+                score = cvss.get("score")
+                score_str = f"{score:.1f}" if isinstance(score, (int, float)) else "N/A"
+
+                cve_id = advisory.get("cve_id") or advisory.get("ghsa_id") or "N/A"
+                state = alert.get("state", "unknown")
+                created_at = alert.get("created_at", "N/A")
+
+                lines.append(f"| `{dep}` | {sev} | {score_str} | {cve_id} | {state} | {created_at} |")
+
+        content = "\n".join(lines) + "\n"
+
+        with open(dst, "w") as f:
+            f.write(content)
+
+        print(content)
+        PYEOF
+
+        # Append to the native GitHub Actions job summary
+        cat scan-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload raw alerts artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: dependabot-raw
+        path: dependabot-raw.json
+        retention-days: 14
+
+    - name: Upload scan summary artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: scan-summary
+        path: scan-summary.md
+        retention-days: 14
