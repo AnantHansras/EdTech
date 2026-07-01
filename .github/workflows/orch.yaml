@@ -1,0 +1,49 @@
+name: Automated OSS Vulnerability Remediation
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  scan-agent:
+    name: "🔍 Scan Agent"
+    runs-on: ubuntu-latest 
+    permissions:
+      contents: read
+      security-events: read 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Scan Agent
+        uses: ./.github/actions/scan-agent
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  triage-agent:
+    name: "🧭 Triage Agent"
+    needs: scan-agent
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Triage Agent
+        uses: ./.github/actions/triage-agent
+
+  remediation-agent:
+    name: "🛠️ Remediation Agent"
+    needs: triage-agent
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Remediation Agent
+        uses: ./.github/actions/remediation-agent
