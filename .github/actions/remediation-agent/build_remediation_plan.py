@@ -10,6 +10,12 @@ ranks its available fixed versions using a severity-weighted score:
 The version with the highest score is listed first in `fixed_version`
 (and its matching entry is listed first in `fix_summary`), separated by `|`.
 
+Each fixed version now also carries the `vulnerable_version_range` ("affected
+version") for every CVE/GHSA it resolves. This is surfaced in two places:
+  - inline in `fix_summary`, next to each vulnerability fragment
+  - aggregated in a new `affected_version_range` field per fixed version,
+    so downstream consumers don't need to re-parse the summary string.
+
 Only alerts that are currently "open" AND have a known first_patched_version
 are considered — an alert with no available fix cannot contribute to a
 remediation recommendation.
@@ -37,7 +43,7 @@ def load_alerts(path: str):
 
 
 def group_by_component(alerts):
-    """component -> version -> list of (cve_id, severity)"""
+    """component -> version -> list of (cve_id, severity, affected_range)"""
     components = defaultdict(lambda: defaultdict(list))
 
     for alert in alerts:
@@ -58,18 +64,19 @@ def group_by_component(alerts):
             continue
 
         severity = vuln.get("severity") or (alert.get("security_advisory") or {}).get("severity", "")
+        affected_range = vuln.get("vulnerable_version_range") or "unknown"
 
         advisory = alert.get("security_advisory") or {}
         cve_id = advisory.get("cve_id") or advisory.get("ghsa_id") or f"alert-{alert.get('number', 'unknown')}"
 
-        components[component][fixed_version].append((cve_id, severity))
+        components[component][fixed_version].append((cve_id, severity, affected_range))
 
     return components
 
 
 def score_version(cve_list):
     """Total severity-weighted score for a single fixed version."""
-    return sum(severity_weight(sev) for _, sev in cve_list)
+    return sum(severity_weight(sev) for _, sev, _ in cve_list)
 
 
 def build_plan(components):
@@ -85,6 +92,7 @@ def build_plan(components):
 
         version_strings = []
         summary_strings = []
+        affected_range_strings = []
 
         for version, cve_list in ranked_versions:
             # Within a version, list the most severe vulnerabilities first.
@@ -93,17 +101,30 @@ def build_plan(components):
                 key=lambda c: (-severity_weight(c[1]), c[0]),
             )
 
-            cve_fragments = [f"{cve_id}({severity.lower()})" for cve_id, severity in ranked_cves]
+            cve_fragments = [
+                f"{cve_id}({severity.lower()}, affected: {affected_range})"
+                for cve_id, severity, affected_range in ranked_cves
+            ]
             summary = "This pr fixes following vulnerabilities " + ", ".join(cve_fragments)
+
+            # De-duplicate affected ranges for this fixed version while
+            # preserving order (a component can have multiple CVEs sharing
+            # the same range, e.g. multiple advisories against one branch).
+            seen_ranges = []
+            for _, _, affected_range in ranked_cves:
+                if affected_range not in seen_ranges:
+                    seen_ranges.append(affected_range)
 
             version_strings.append(version)
             summary_strings.append(summary)
+            affected_range_strings.append(", ".join(seen_ranges))
 
         plan.append(
             {
                 "component": component,
                 "fixed_version": "|".join(version_strings),
                 "fix_summary": "|".join(summary_strings),
+                "affected_version_range": "|".join(affected_range_strings),
             }
         )
 
