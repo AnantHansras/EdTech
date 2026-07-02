@@ -55,10 +55,10 @@ runs:
         alerts = json.load(open(src))
 
         SEV_EMOJI = {
-            "critical": "🔴 Critical",
-            "high": "🟠 High",
-            "medium": "🟡 Medium",
-            "low": "🟢 Low",
+            "critical": "Critical",
+            "high": "High",
+            "medium": "Medium",
+            "low": "Low",
         }
         SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
