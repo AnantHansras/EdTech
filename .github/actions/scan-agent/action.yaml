@@ -64,7 +64,7 @@ runs:
 
         HEADERS = [
             "Manifest Path", "Dependency", "Ecosystem", "Scope", "Relationship",
-            "CVE ID", "GHSA ID", "Summary", "Description", "Severity",
+            "CVE ID", "GHSA ID", "Summary", "Severity",
             "CVSS Score", "Vulnerable Range", "First Patched Version", "Alert Link",
         ]
 
@@ -74,15 +74,18 @@ runs:
 
         def cvss_score(advisory):
             severities = advisory.get("cvss_severities") or {}
-            v4 = severities.get("cvss_v4") or {}
-            if v4.get("score") is not None:
-                return f"{v4['score']:.1f} (v4)"
-            v3 = severities.get("cvss_v3") or {}
-            if v3.get("score") is not None:
-                return f"{v3['score']:.1f} (v3)"
-            legacy = advisory.get("cvss") or {}
-            if legacy.get("score") is not None:
-                return f"{legacy['score']:.1f} (v3)"
+            v4_score = (severities.get("cvss_v4") or {}).get("score")
+            if v4_score:
+                return f"{v4_score:.1f} (v4)"
+
+            v3_score = (severities.get("cvss_v3") or {}).get("score")
+            if v3_score is not None:
+                return f"{v3_score:.1f} (v3)"
+
+            legacy_score = (advisory.get("cvss") or {}).get("score")
+            if legacy_score is not None:
+                return f"{legacy_score:.1f} (v3)"
+
             return "N/A"
 
         def row_for(alert):
@@ -101,7 +104,6 @@ runs:
                 advisory.get("cve_id"),
                 advisory.get("ghsa_id"),
                 advisory.get("summary"),
-                advisory.get("description"),
                 SEV_EMOJI.get((vulnerability.get("severity") or "").lower(), vulnerability.get("severity", "Unknown")),
                 cvss_score(advisory),
                 vulnerability.get("vulnerable_version_range"),
@@ -142,4 +144,11 @@ runs:
       with:
         name: dependabot-raw
         path: dependabot-raw.json
+        retention-days: 14
+
+    - name: Upload scan summary artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: scan-summary
+        path: scan-summary.md
         retention-days: 14
