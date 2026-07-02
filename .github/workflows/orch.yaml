@@ -20,7 +20,7 @@ jobs:
       - name: Run Scan Agent
         uses: ./.github/actions/scan-agent
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.PAT_TOKEN }}
 
   triage-agent:
     name: "🧭 Triage Agent"
