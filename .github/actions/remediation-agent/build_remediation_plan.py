@@ -2,19 +2,29 @@
 """
 Remediation Agent scoring engine.
 
-Groups Dependabot alerts by dependency component, then for each component
-ranks its available fixed versions using a severity-weighted score:
+Groups Dependabot alerts by dependency component. Each component may have
+several open CVEs, each tied to its own `first_patched_version` and
+`vulnerable_version_range`. A component can therefore have multiple distinct
+"fixed version" candidates (e.g. nodemailer 8.0.8 and 8.0.9).
 
-    score(version) = sum(SEVERITY_WEIGHT[severity] for each vuln fixed by that version)
+Naively scoring each candidate version only by the CVEs whose own
+first_patched_version equals it undercounts what upgrading actually buys you:
+a higher version typically also resolves CVEs that were already patched at a
+lower version. So instead, for every candidate fixed version V of a
+component, we use `vulnerable_version_range` to determine how many of *all*
+that component's CVEs V actually resolves (i.e. V falls outside the CVE's
+vulnerable range), and score V on that cumulative set:
 
-The version with the highest score is listed first in `fixed_version`
-(and its matching entry is listed first in `fix_summary`), separated by `|`.
+    score(V) = sum(SEVERITY_WEIGHT[severity] for each CVE V resolves)
 
-Each fixed version now also carries the `vulnerable_version_range` ("affected
-version") for every CVE/GHSA it resolves. This is surfaced in two places:
-  - inline in `fix_summary`, next to each vulnerability fragment
-  - aggregated in a new `affected_version_range` field per fixed version,
-    so downstream consumers don't need to re-parse the summary string.
+Fixed versions are ordered in the response (highest first) by:
+    (-score, -number_of_cves_resolved, version string ascending)
+
+The `fixed_version` and `fix_summary` fields keep their original meaning —
+each entry still only *lists* the CVEs whose own first_patched_version is
+exactly that version — only the ORDER of the entries changes based on the
+cumulative scoring above. No affected/vulnerable-range text is included in
+the output.
 
 Only alerts that are currently "open" AND have a known first_patched_version
 are considered — an alert with no available fix cannot contribute to a
@@ -22,6 +32,7 @@ remediation recommendation.
 """
 
 import json
+import re
 import sys
 from collections import defaultdict
 
@@ -42,9 +53,94 @@ def load_alerts(path: str):
         return json.load(f)
 
 
+# ---------------------------------------------------------------------------
+# Minimal version comparison + range parsing.
+#
+# Versions are dotted numeric strings ("8.0.8", "4.0.6"). Ranges look like
+# "<= 8.0.8", "< 4.0.6", ">= 4.0.0, < 4.0.6". This is intentionally simple
+# (no pre-release/build-metadata handling) since Dependabot's
+# vulnerable_version_range strings for npm/most ecosystems fit this shape.
+# ---------------------------------------------------------------------------
+
+def parse_version(v: str):
+    parts = []
+    for chunk in re.split(r"[.\-+]", v.strip()):
+        m = re.match(r"\d+", chunk)
+        parts.append(int(m.group()) if m else 0)
+    return tuple(parts)
+
+
+def compare_versions(v1: str, v2: str) -> int:
+    p1, p2 = parse_version(v1), parse_version(v2)
+    length = max(len(p1), len(p2))
+    p1 = p1 + (0,) * (length - len(p1))
+    p2 = p2 + (0,) * (length - len(p2))
+    if p1 < p2:
+        return -1
+    if p1 > p2:
+        return 1
+    return 0
+
+
+_OPS = (">=", "<=", ">", "<", "=")
+
+
+def parse_constraints(range_str: str):
+    constraints = []
+    for part in (range_str or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        for op in _OPS:
+            if part.startswith(op):
+                constraints.append((op, part[len(op):].strip()))
+                break
+    return constraints
+
+
+def version_satisfies_range(version: str, range_str: str) -> bool:
+    """True if `version` falls inside the vulnerable range (i.e. is still vulnerable)."""
+    constraints = parse_constraints(range_str)
+    if not constraints:
+        return False
+    for op, bound in constraints:
+        cmp = compare_versions(version, bound)
+        if op == ">=" and not (cmp >= 0):
+            return False
+        if op == "<=" and not (cmp <= 0):
+            return False
+        if op == ">" and not (cmp > 0):
+            return False
+        if op == "<" and not (cmp < 0):
+            return False
+        if op == "=" and not (cmp == 0):
+            return False
+    return True
+
+
+def resolves_cve(candidate_version: str, cve_patched_version: str, cve_range: str):
+    """
+    Does upgrading to `candidate_version` resolve a CVE whose own fix is
+    `cve_patched_version` / vulnerable range `cve_range`?
+
+    Preferred check: candidate_version is outside the vulnerable range.
+    Falls back to plain version comparison if the range is missing/unparseable.
+    """
+    if cve_range:
+        constraints = parse_constraints(cve_range)
+        if constraints:
+            return not version_satisfies_range(candidate_version, cve_range)
+    # Fallback: no usable range, just compare against the CVE's own fixed version.
+    return compare_versions(candidate_version, cve_patched_version) >= 0
+
+
+# ---------------------------------------------------------------------------
+# Alert grouping
+# ---------------------------------------------------------------------------
+
 def group_by_component(alerts):
-    """component -> version -> list of (cve_id, severity, affected_range)"""
-    components = defaultdict(lambda: defaultdict(list))
+    """component -> list of (cve_id, severity, patched_version, affected_range)"""
+    components = defaultdict(list)
 
     for alert in alerts:
         if alert.get("state") != "open":
@@ -64,67 +160,66 @@ def group_by_component(alerts):
             continue
 
         severity = vuln.get("severity") or (alert.get("security_advisory") or {}).get("severity", "")
-        affected_range = vuln.get("vulnerable_version_range") or "unknown"
+        affected_range = vuln.get("vulnerable_version_range") or ""
 
         advisory = alert.get("security_advisory") or {}
         cve_id = advisory.get("cve_id") or advisory.get("ghsa_id") or f"alert-{alert.get('number', 'unknown')}"
 
-        components[component][fixed_version].append((cve_id, severity, affected_range))
+        components[component].append((cve_id, severity, fixed_version, affected_range))
 
     return components
-
-
-def score_version(cve_list):
-    """Total severity-weighted score for a single fixed version."""
-    return sum(severity_weight(sev) for _, sev, _ in cve_list)
 
 
 def build_plan(components):
     plan = []
 
-    for component, versions in components.items():
-        # Rank versions: highest score first, then most vulnerabilities fixed,
-        # then version string ascending (deterministic tie-break).
+    for component, cves in components.items():
+        candidate_versions = sorted({v for (_, _, v, _) in cves})
+
+        # For every candidate fixed version, work out the *cumulative* set of
+        # CVEs it resolves (using affected_version_range), and score that set.
+        version_stats = {}
+        for candidate in candidate_versions:
+            resolved = [
+                (cve_id, severity)
+                for (cve_id, severity, patched_version, affected_range) in cves
+                if resolves_cve(candidate, patched_version, affected_range)
+            ]
+            version_stats[candidate] = {
+                "score": sum(severity_weight(sev) for _, sev in resolved),
+                "count": len(resolved),
+            }
+
+        # Order candidate versions: highest cumulative score first, then most
+        # CVEs resolved, then version string ascending (deterministic tie-break).
         ranked_versions = sorted(
-            versions.items(),
-            key=lambda item: (-score_version(item[1]), -len(item[1]), item[0]),
+            candidate_versions,
+            key=lambda v: (-version_stats[v]["score"], -version_stats[v]["count"], v),
         )
+
+        # Direct mapping: which CVEs are *listed* under each version in the
+        # response (only those whose own first_patched_version is that version).
+        direct_cves_by_version = defaultdict(list)
+        for (cve_id, severity, patched_version, _affected_range) in cves:
+            direct_cves_by_version[patched_version].append((cve_id, severity))
 
         version_strings = []
         summary_strings = []
-        affected_range_strings = []
 
-        for version, cve_list in ranked_versions:
-            # Within a version, list the most severe vulnerabilities first.
-            ranked_cves = sorted(
-                cve_list,
-                key=lambda c: (-severity_weight(c[1]), c[0]),
-            )
-
-            cve_fragments = [
-                f"{cve_id}({severity.lower()}, affected: {affected_range})"
-                for cve_id, severity, affected_range in ranked_cves
-            ]
+        for version in ranked_versions:
+            direct = direct_cves_by_version.get(version, [])
+            ranked_direct = sorted(direct, key=lambda c: (-severity_weight(c[1]), c[0]))
+            cve_fragments = [f"{cve_id}({severity.lower()})" for cve_id, severity in ranked_direct]
             summary = "This pr fixes following vulnerabilities " + ", ".join(cve_fragments)
-
-            # De-duplicate affected ranges for this fixed version while
-            # preserving order (a component can have multiple CVEs sharing
-            # the same range, e.g. multiple advisories against one branch).
-            seen_ranges = []
-            for _, _, affected_range in ranked_cves:
-                if affected_range not in seen_ranges:
-                    seen_ranges.append(affected_range)
 
             version_strings.append(version)
             summary_strings.append(summary)
-            affected_range_strings.append(", ".join(seen_ranges))
 
         plan.append(
             {
                 "component": component,
                 "fixed_version": "|".join(version_strings),
                 "fix_summary": "|".join(summary_strings),
-                "affected_version_range": "|".join(affected_range_strings),
             }
         )
 
