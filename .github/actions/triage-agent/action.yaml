@@ -77,9 +77,7 @@ runs:
 
         total_files = len(source_files)
 
-        def usage_percentage(component):
-            if total_files == 0:
-                return 0.0
+        def usage_file_count(component):
             # Match `require('pkg')`, `require("pkg/sub")`, `from 'pkg'`, `import 'pkg'`, python `import pkg`.
             pattern = re.compile(
                 r"""(require\(\s*['"]""" + re.escape(component) + r"""(/[^'"]*)?['"]\s*\))"""
@@ -96,11 +94,11 @@ runs:
                     continue
                 if pattern.search(content):
                     hits += 1
-            return round((hits / total_files) * 100, 2)
+            return hits
 
         rows = []
         for component, data in components.items():
-            usage_pct = usage_percentage(component)
+            file_count = usage_file_count(component)
             sev_counts = data["sev_counts"]
             rows.append({
                 "component": component,
@@ -108,12 +106,12 @@ runs:
                 "fixed_versions": sorted(data["fixed_versions"]),
                 "sev_counts": sev_counts,
                 "critical_high_count": sev_counts["critical"] + sev_counts["high"],
-                "usage_pct": usage_pct,
+                "file_count": file_count,
             })
 
         # Sort: highest combined critical+high count first, then highest
-        # repo-usage % first, then component name ascending for determinism.
-        rows.sort(key=lambda r: (-r["critical_high_count"], -r["usage_pct"], r["component"]))
+        # file-usage count first, then component name ascending for determinism.
+        rows.sort(key=lambda r: (-r["critical_high_count"], -r["file_count"], r["component"]))
 
         # -------------------------------------------------------------
         # Render Job Summary
@@ -123,19 +121,19 @@ runs:
         lines.append("")
         lines.append(f"**Total alerts triaged:** {len(alerts)}  ")
         lines.append(f"**Distinct components:** {len(rows)}  ")
-        lines.append(f"**Source files scanned for usage %:** {total_files}")
+        lines.append(f"**Source files scanned:** {total_files}")
         lines.append("")
 
         if not rows:
             lines.append("_No alerts to triage._")
         else:
-            lines.append("Sorted by combined Critical+High count, then by % of the repo that imports the component.")
+            lines.append(f"Sorted by combined Critical+High count, then by number of files (out of {total_files}) that use the component.")
             lines.append("")
-            lines.append("| Rank | Component | 🔴 Critical | 🟠 High | 🟡 Medium | 🟢 Low | Used In Repo | CVE / GHSA IDs | Fixed Versions |")
+            lines.append("| Rank | Component | 🔴 Critical | 🟠 High | 🟡 Medium | 🟢 Low | Used In Files | CVE / GHSA IDs | Fixed Versions |")
             lines.append("|---|---|---|---|---|---|---|---|---|")
             for rank, row in enumerate(rows, start=1):
                 sc = row["sev_counts"]
-                usage = f"{row['usage_pct']:.1f}%"
+                usage = f"{row['file_count']}/{total_files}"
                 cve_list = ", ".join(f"`{c}`" for c in row["cves"]) or "N/A"
                 fixed_list = ", ".join(f"`{v}`" for v in row["fixed_versions"]) or "N/A"
                 lines.append(
