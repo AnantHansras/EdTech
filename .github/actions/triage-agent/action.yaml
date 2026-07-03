@@ -1,5 +1,5 @@
 name: 'Triage Agent'
-description: 'Downloads the raw Dependabot alert data, groups alerts by component, and produces a severity + repo-usage sorted Job Summary. Produces no artifacts.'
+description: 'Downloads the raw Dependabot alert data, groups alerts by component, and produces a severity + repo-usage + dependency-centrality sorted Job Summary. Produces no artifacts.'
 runs:
   using: 'composite'
   steps:
@@ -61,12 +61,11 @@ runs:
                 entry["sev_counts"][severity] += 1
 
         # -------------------------------------------------------------
-        # Compute "% used in repository" per component: the share of
-        # scanned source files that actually import/require the package.
-        # (No external tool required — a plain repo-wide scan.)
+        # Walk the repo once to build the source-file inventory.
         # -------------------------------------------------------------
         SKIP_DIRS = {".git", "node_modules", "dist", "build", "vendor", ".venv", "venv", "__pycache__"}
         SOURCE_EXT = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".go", ".rb", ".java", ".php"}
+        RESOLVABLE_EXT = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py"]
 
         source_files = []
         for dirpath, dirnames, filenames in os.walk(repo_root):
@@ -77,28 +76,107 @@ runs:
 
         total_files = len(source_files)
 
-        def usage_file_count(component):
-            # Match `require('pkg')`, `require("pkg/sub")`, `from 'pkg'`, `import 'pkg'`, python `import pkg`.
+        file_contents = {}
+        for path in source_files:
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                    file_contents[path] = fh.read()
+            except OSError:
+                file_contents[path] = ""
+
+        # -------------------------------------------------------------
+        # Build the *internal* module dependency graph (which repo
+        # files import which other repo files) so we can measure
+        # "dependency centrality": how many other internal modules
+        # transitively rely on a file that pulls in a vulnerable
+        # component. A file with many internal dependents that also
+        # imports a flagged package raises that package's blast radius.
+        # -------------------------------------------------------------
+        RELATIVE_IMPORT_RE = re.compile(
+            r"""(?:require\(\s*['"](?P<req>\.{1,2}/[^'"]*)['"]\s*\))"""
+            r"""|(?:from\s+['"](?P<esfrom>\.{1,2}/[^'"]*)['"])"""
+            r"""|(?:import\s+['"](?P<esimport>\.{1,2}/[^'"]*)['"])"""
+            r"""|(?:^\s*from\s+(?P<pyfrom>\.+[a-zA-Z0-9_.]*)\s+import)"""
+        )
+
+        def resolve_js_like(base_dir, rel_path):
+            candidate = os.path.normpath(os.path.join(base_dir, rel_path))
+            if os.path.isfile(candidate):
+                return candidate
+            for ext in RESOLVABLE_EXT:
+                if os.path.isfile(candidate + ext):
+                    return candidate + ext
+            for ext in RESOLVABLE_EXT:
+                index_candidate = os.path.join(candidate, "index" + ext)
+                if os.path.isfile(index_candidate):
+                    return index_candidate
+            return None
+
+        def resolve_py_relative(base_dir, dotted):
+            # Count leading dots to know how many directories to walk up.
+            depth = len(dotted) - len(dotted.lstrip("."))
+            remainder = dotted[depth:]
+            target_dir = base_dir
+            for _ in range(depth - 1):
+                target_dir = os.path.dirname(target_dir)
+            if not remainder:
+                return None
+            parts = remainder.split(".")
+            candidate = os.path.normpath(os.path.join(target_dir, *parts))
+            if os.path.isfile(candidate + ".py"):
+                return candidate + ".py"
+            init_candidate = os.path.join(candidate, "__init__.py")
+            if os.path.isfile(init_candidate):
+                return init_candidate
+            return None
+
+        # dependents[file] = set of internal files that import `file`
+        dependents = defaultdict(set)
+
+        for path in source_files:
+            base_dir = os.path.dirname(path)
+            content = file_contents[path]
+            for m in RELATIVE_IMPORT_RE.finditer(content):
+                target = None
+                if m.group("req"):
+                    target = resolve_js_like(base_dir, m.group("req"))
+                elif m.group("esfrom"):
+                    target = resolve_js_like(base_dir, m.group("esfrom"))
+                elif m.group("esimport"):
+                    target = resolve_js_like(base_dir, m.group("esimport"))
+                elif m.group("pyfrom"):
+                    target = resolve_py_relative(base_dir, m.group("pyfrom"))
+                if target and target != path:
+                    dependents[target].add(path)
+
+        # Internal in-degree = how many distinct internal modules depend on this file.
+        internal_in_degree = {path: len(dependents.get(path, ())) for path in source_files}
+
+        # -------------------------------------------------------------
+        # Compute, per vulnerable component:
+        #   - file_count: how many source files import the component directly
+        #   - centrality: sum of internal in-degree across those importing
+        #     files, i.e. how deeply embedded those consumers are in the
+        #     codebase's own internal dependency graph
+        # -------------------------------------------------------------
+        def usage_files(component):
             pattern = re.compile(
                 r"""(require\(\s*['"]""" + re.escape(component) + r"""(/[^'"]*)?['"]\s*\))"""
                 r"""|(from\s+['"]""" + re.escape(component) + r"""(/[^'"]*)?['"])"""
                 r"""|(import\s+['"]""" + re.escape(component) + r"""(/[^'"]*)?['"])"""
                 r"""|(^\s*(import|from)\s+""" + re.escape(component.replace("-", "_")) + r"""\b)"""
             )
-            hits = 0
+            matches = []
             for path in source_files:
-                try:
-                    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                        content = fh.read()
-                except OSError:
-                    continue
-                if pattern.search(content):
-                    hits += 1
-            return hits
+                if pattern.search(file_contents[path]):
+                    matches.append(path)
+            return matches
 
         rows = []
         for component, data in components.items():
-            file_count = usage_file_count(component)
+            files_using = usage_files(component)
+            file_count = len(files_using)
+            centrality = sum(internal_in_degree.get(f, 0) for f in files_using)
             sev_counts = data["sev_counts"]
             rows.append({
                 "component": component,
@@ -107,11 +185,16 @@ runs:
                 "sev_counts": sev_counts,
                 "critical_high_count": sev_counts["critical"] + sev_counts["high"],
                 "file_count": file_count,
+                "centrality": centrality,
             })
 
-        # Sort: highest combined critical+high count first, then highest
-        # file-usage count first, then component name ascending for determinism.
-        rows.sort(key=lambda r: (-r["critical_high_count"], -r["file_count"], r["component"]))
+        # Sort priority:
+        #   1. highest combined critical+high severity count
+        #   2. highest dependency centrality (blast radius across the
+        #      internal module graph)
+        #   3. highest raw file-usage count
+        #   4. component name ascending, for determinism
+        rows.sort(key=lambda r: (-r["critical_high_count"], -r["centrality"], -r["file_count"], r["component"]))
 
         # -------------------------------------------------------------
         # Render Job Summary
@@ -127,10 +210,14 @@ runs:
         if not rows:
             lines.append("_No alerts to triage._")
         else:
-            lines.append(f"Sorted by combined Critical+High count, then by number of files (out of {total_files}) that use the component.")
+            lines.append(
+                f"Sorted by combined Critical+High count, then by Dependency Centrality "
+                f"(sum of internal in-degree across the files that import the component), "
+                f"then by number of files (out of {total_files}) that use the component."
+            )
             lines.append("")
-            lines.append("| Rank | Component | 🔴 Critical | 🟠 High | 🟡 Medium | 🟢 Low | Used In Files | CVE / GHSA IDs | Fixed Versions |")
-            lines.append("|---|---|---|---|---|---|---|---|---|")
+            lines.append("| Rank | Component | 🔴 Critical | 🟠 High | 🟡 Medium | 🟢 Low | Dependency Centrality | Used In Files | CVE / GHSA IDs | Fixed Versions |")
+            lines.append("|---|---|---|---|---|---|---|---|---|---|")
             for rank, row in enumerate(rows, start=1):
                 sc = row["sev_counts"]
                 usage = f"{row['file_count']}/{total_files}"
@@ -138,7 +225,7 @@ runs:
                 fixed_list = ", ".join(f"`{v}`" for v in row["fixed_versions"]) or "N/A"
                 lines.append(
                     f"| {rank} | `{row['component']}` | {sc['critical']} | {sc['high']} | {sc['medium']} | {sc['low']} "
-                    f"| {usage} | {cve_list} | {fixed_list} |"
+                    f"| {row['centrality']} | {usage} | {cve_list} | {fixed_list} |"
                 )
 
         content = "\n".join(lines) + "\n"
