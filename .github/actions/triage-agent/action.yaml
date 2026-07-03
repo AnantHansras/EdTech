@@ -25,25 +25,16 @@ runs:
         with open(src) as f:
             alerts = json.load(f)
 
-        SEVERITY_WEIGHT = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-        SEV_EMOJI = {
-            "critical": "🔴 Critical",
-            "high": "🟠 High",
-            "medium": "🟡 Medium",
-            "low": "🟢 Low",
-        }
-
-        def severity_weight(sev):
-            return SEVERITY_WEIGHT.get((sev or "").lower(), 0)
-
-        def severity_label(sev):
-            sev = (sev or "").lower()
-            return SEV_EMOJI.get(sev, sev.title() or "Unknown")
-
         # -------------------------------------------------------------
         # Group raw alerts by component (dependency package name)
         # -------------------------------------------------------------
-        components = defaultdict(lambda: {"cves": set(), "fixed_versions": set(), "max_sev_weight": 0, "max_sev": "unknown"})
+        SEVERITY_LEVELS = ("critical", "high", "medium", "low")
+
+        components = defaultdict(lambda: {
+            "cves": set(),
+            "fixed_versions": set(),
+            "sev_counts": {level: 0 for level in SEVERITY_LEVELS},
+        })
 
         for alert in alerts:
             dependency = alert.get("dependency") or {}
@@ -56,7 +47,7 @@ runs:
             vuln = alert.get("security_vulnerability") or {}
 
             cve_id = advisory.get("cve_id") or advisory.get("ghsa_id") or f"alert-{alert.get('number', 'unknown')}"
-            severity = vuln.get("severity") or advisory.get("severity") or "unknown"
+            severity = (vuln.get("severity") or advisory.get("severity") or "unknown").lower()
 
             patched = vuln.get("first_patched_version") or {}
             fixed_version = patched.get("identifier")
@@ -66,10 +57,8 @@ runs:
             if fixed_version:
                 entry["fixed_versions"].add(fixed_version)
 
-            w = severity_weight(severity)
-            if w > entry["max_sev_weight"]:
-                entry["max_sev_weight"] = w
-                entry["max_sev"] = severity.lower()
+            if severity in entry["sev_counts"]:
+                entry["sev_counts"][severity] += 1
 
         # -------------------------------------------------------------
         # Compute "% used in repository" per component: the share of
@@ -112,18 +101,19 @@ runs:
         rows = []
         for component, data in components.items():
             usage_pct = usage_percentage(component)
+            sev_counts = data["sev_counts"]
             rows.append({
                 "component": component,
                 "cves": sorted(data["cves"]),
                 "fixed_versions": sorted(data["fixed_versions"]),
-                "max_sev": data["max_sev"],
-                "max_sev_weight": data["max_sev_weight"],
+                "sev_counts": sev_counts,
+                "critical_high_count": sev_counts["critical"] + sev_counts["high"],
                 "usage_pct": usage_pct,
             })
 
-        # Sort: highest max severity first, then highest repo-usage % first,
-        # then component name ascending for determinism.
-        rows.sort(key=lambda r: (-r["max_sev_weight"], -r["usage_pct"], r["component"]))
+        # Sort: highest combined critical+high count first, then highest
+        # repo-usage % first, then component name ascending for determinism.
+        rows.sort(key=lambda r: (-r["critical_high_count"], -r["usage_pct"], r["component"]))
 
         # -------------------------------------------------------------
         # Render Job Summary
@@ -139,16 +129,19 @@ runs:
         if not rows:
             lines.append("_No alerts to triage._")
         else:
-            lines.append("Sorted by max severity, then by % of the repo that imports the component.")
+            lines.append("Sorted by combined Critical+High count, then by % of the repo that imports the component.")
             lines.append("")
-            lines.append("| Rank | Component | Max Severity | Used In Repo | CVE / GHSA IDs | Fixed Versions |")
-            lines.append("|---|---|---|---|---|---|")
+            lines.append("| Rank | Component | 🔴 Critical | 🟠 High | 🟡 Medium | 🟢 Low | Used In Repo | CVE / GHSA IDs | Fixed Versions |")
+            lines.append("|---|---|---|---|---|---|---|---|---|")
             for rank, row in enumerate(rows, start=1):
-                sev = severity_label(row["max_sev"])
+                sc = row["sev_counts"]
                 usage = f"{row['usage_pct']:.1f}%"
                 cve_list = ", ".join(f"`{c}`" for c in row["cves"]) or "N/A"
                 fixed_list = ", ".join(f"`{v}`" for v in row["fixed_versions"]) or "N/A"
-                lines.append(f"| {rank} | `{row['component']}` | {sev} | {usage} | {cve_list} | {fixed_list} |")
+                lines.append(
+                    f"| {rank} | `{row['component']}` | {sc['critical']} | {sc['high']} | {sc['medium']} | {sc['low']} "
+                    f"| {usage} | {cve_list} | {fixed_list} |"
+                )
 
         content = "\n".join(lines) + "\n"
 
