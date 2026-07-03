@@ -1,6 +1,5 @@
 name: 'Triage Agent'
-description: 'Downloads the raw Dependabot alert data and produces a CVSS-sorted Job Summary. Produces no artifacts.'
-
+description: 'Downloads the raw Dependabot alert data, groups alerts by component, and produces a severity + repo-usage sorted Job Summary. Produces no artifacts.'
 runs:
   using: 'composite'
   steps:
@@ -10,20 +9,23 @@ runs:
         name: dependabot-raw
         path: .
 
-    - name: Generate CVSS-sorted Job Summary
+    - name: Generate component-grouped Job Summary
       shell: bash
       run: |
         set -euo pipefail
-        python3 - "$PWD/dependabot-raw.json" <<'PYEOF'
+        python3 - "$PWD/dependabot-raw.json" "$GITHUB_WORKSPACE" <<'PYEOF'
         import json
-        import sys
         import os
+        import re
+        import sys
+        from collections import defaultdict
 
-        src = sys.argv[1]
+        src, repo_root = sys.argv[1], sys.argv[2]
 
         with open(src) as f:
             alerts = json.load(f)
 
+        SEVERITY_WEIGHT = {"critical": 4, "high": 3, "medium": 2, "low": 1}
         SEV_EMOJI = {
             "critical": "🔴 Critical",
             "high": "🟠 High",
@@ -31,40 +33,122 @@ runs:
             "low": "🟢 Low",
         }
 
-        def cvss_score(alert):
+        def severity_weight(sev):
+            return SEVERITY_WEIGHT.get((sev or "").lower(), 0)
+
+        def severity_label(sev):
+            sev = (sev or "").lower()
+            return SEV_EMOJI.get(sev, sev.title() or "Unknown")
+
+        # -------------------------------------------------------------
+        # Group raw alerts by component (dependency package name)
+        # -------------------------------------------------------------
+        components = defaultdict(lambda: {"cves": set(), "fixed_versions": set(), "max_sev_weight": 0, "max_sev": "unknown"})
+
+        for alert in alerts:
+            dependency = alert.get("dependency") or {}
+            package = dependency.get("package") or {}
+            component = package.get("name")
+            if not component:
+                continue
+
             advisory = alert.get("security_advisory") or {}
-            cvss = advisory.get("cvss") or {}
-            score = cvss.get("score")
-            return score if isinstance(score, (int, float)) else -1.0
+            vuln = alert.get("security_vulnerability") or {}
 
+            cve_id = advisory.get("cve_id") or advisory.get("ghsa_id") or f"alert-{alert.get('number', 'unknown')}"
+            severity = vuln.get("severity") or advisory.get("severity") or "unknown"
+
+            patched = vuln.get("first_patched_version") or {}
+            fixed_version = patched.get("identifier")
+
+            entry = components[component]
+            entry["cves"].add(cve_id)
+            if fixed_version:
+                entry["fixed_versions"].add(fixed_version)
+
+            w = severity_weight(severity)
+            if w > entry["max_sev_weight"]:
+                entry["max_sev_weight"] = w
+                entry["max_sev"] = severity.lower()
+
+        # -------------------------------------------------------------
+        # Compute "% used in repository" per component: the share of
+        # scanned source files that actually import/require the package.
+        # (No external tool required — a plain repo-wide scan.)
+        # -------------------------------------------------------------
+        SKIP_DIRS = {".git", "node_modules", "dist", "build", "vendor", ".venv", "venv", "__pycache__"}
+        SOURCE_EXT = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".go", ".rb", ".java", ".php"}
+
+        source_files = []
+        for dirpath, dirnames, filenames in os.walk(repo_root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+            for fname in filenames:
+                if os.path.splitext(fname)[1] in SOURCE_EXT:
+                    source_files.append(os.path.join(dirpath, fname))
+
+        total_files = len(source_files)
+
+        def usage_percentage(component):
+            if total_files == 0:
+                return 0.0
+            # Match `require('pkg')`, `require("pkg/sub")`, `from 'pkg'`, `import 'pkg'`, python `import pkg`.
+            pattern = re.compile(
+                r"""(require\(\s*['"]""" + re.escape(component) + r"""(/[^'"]*)?['"]\s*\))"""
+                r"""|(from\s+['"]""" + re.escape(component) + r"""(/[^'"]*)?['"])"""
+                r"""|(import\s+['"]""" + re.escape(component) + r"""(/[^'"]*)?['"])"""
+                r"""|(^\s*(import|from)\s+""" + re.escape(component.replace("-", "_")) + r"""\b)"""
+            )
+            hits = 0
+            for path in source_files:
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                        content = fh.read()
+                except OSError:
+                    continue
+                if pattern.search(content):
+                    hits += 1
+            return round((hits / total_files) * 100, 2)
+
+        rows = []
+        for component, data in components.items():
+            usage_pct = usage_percentage(component)
+            rows.append({
+                "component": component,
+                "cves": sorted(data["cves"]),
+                "fixed_versions": sorted(data["fixed_versions"]),
+                "max_sev": data["max_sev"],
+                "max_sev_weight": data["max_sev_weight"],
+                "usage_pct": usage_pct,
+            })
+
+        # Sort: highest max severity first, then highest repo-usage % first,
+        # then component name ascending for determinism.
+        rows.sort(key=lambda r: (-r["max_sev_weight"], -r["usage_pct"], r["component"]))
+
+        # -------------------------------------------------------------
+        # Render Job Summary
+        # -------------------------------------------------------------
         lines = []
-        lines.append("## 🧭 Triage Agent — Alerts Sorted by CVSS Score (Descending)")
+        lines.append("## 🧭 Triage Agent — Alerts Grouped by Component")
         lines.append("")
-        lines.append(f"**Total alerts triaged:** {len(alerts)}")
+        lines.append(f"**Total alerts triaged:** {len(alerts)}  ")
+        lines.append(f"**Distinct components:** {len(rows)}  ")
+        lines.append(f"**Source files scanned for usage %:** {total_files}")
         lines.append("")
 
-        if not alerts:
+        if not rows:
             lines.append("_No alerts to triage._")
         else:
-            lines.append("| Rank | Dependency | Severity | CVSS Score | CVE / GHSA ID | State | Created At |")
-            lines.append("|---|---|---|---|---|---|---|")
-
-            sorted_alerts = sorted(alerts, key=cvss_score, reverse=True)
-
-            for rank, alert in enumerate(sorted_alerts, start=1):
-                dep = (alert.get("dependency") or {}).get("package", {}).get("name", "unknown")
-                sev_raw = (alert.get("security_vulnerability") or {}).get("severity", "unknown").lower()
-                sev = SEV_EMOJI.get(sev_raw, sev_raw.title() or "Unknown")
-
-                score = cvss_score(alert)
-                score_str = f"{score:.1f}" if score >= 0 else "N/A"
-
-                advisory = alert.get("security_advisory") or {}
-                cve_id = advisory.get("cve_id") or advisory.get("ghsa_id") or "N/A"
-                state = alert.get("state", "unknown")
-                created_at = alert.get("created_at", "N/A")
-
-                lines.append(f"| {rank} | `{dep}` | {sev} | {score_str} | {cve_id} | {state} | {created_at} |")
+            lines.append("Sorted by max severity, then by % of the repo that imports the component.")
+            lines.append("")
+            lines.append("| Rank | Component | Max Severity | Used In Repo | CVE / GHSA IDs | Fixed Versions |")
+            lines.append("|---|---|---|---|---|---|")
+            for rank, row in enumerate(rows, start=1):
+                sev = severity_label(row["max_sev"])
+                usage = f"{row['usage_pct']:.1f}%"
+                cve_list = ", ".join(f"`{c}`" for c in row["cves"]) or "N/A"
+                fixed_list = ", ".join(f"`{v}`" for v in row["fixed_versions"]) or "N/A"
+                lines.append(f"| {rank} | `{row['component']}` | {sev} | {usage} | {cve_list} | {fixed_list} |")
 
         content = "\n".join(lines) + "\n"
 
@@ -75,5 +159,4 @@ runs:
 
         print(content)
         PYEOF
-
         # NOTE: This job intentionally uploads no artifacts, per spec.
