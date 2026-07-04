@@ -1,15 +1,18 @@
 name: 'Scan Agent'
 description: 'Fetches all Dependabot alerts for the repository, writes a Job Summary table, and uploads raw data artifacts for downstream jobs.'
 
+
 inputs:
   github-token:
     description: 'Token used to call the GitHub REST API. Needs security_events:read (or contents+security_events for private repos).'
     required: true
     default: ${{ github.token }}
 
+
 runs:
   using: 'composite'
   steps:
+
     - name: Fetch Dependabot alerts
       shell: bash
       env:
@@ -22,122 +25,21 @@ runs:
           "/repos/${REPO}/dependabot/alerts?state=open&per_page=100" \
           --jq '.[]' >> raw_alerts.jsonl || true
 
+
     - name: Build raw JSON array
       shell: bash
       run: |
         set -euo pipefail
-        python3 - "$PWD/raw_alerts.jsonl" "$PWD/dependabot-raw.json" <<'PYEOF'
-        import json, sys
+        python3 "${{ github.action_path }}/alerts.py" "$PWD/raw_alerts.jsonl" "$PWD/dependabot-raw.json"
 
-        src, dst = sys.argv[1], sys.argv[2]
-        alerts = []
-        try:
-            with open(src) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        alerts.append(json.loads(line))
-        except FileNotFoundError:
-            pass
-
-        json.dump(alerts, open(dst, "w"), indent=2)
-        print(f"Collected {len(alerts)} alert(s)")
-        PYEOF
 
     - name: Generate Job Summary table
       shell: bash
       run: |
         set -euo pipefail
-        python3 - "$PWD/dependabot-raw.json" "$PWD/scan-summary.md" <<'PYEOF'
-        import json, sys
-
-        src, dst = sys.argv[1], sys.argv[2]
-        alerts = json.load(open(src))
-
-        SEV_EMOJI = {
-            "critical": "Critical",
-            "high": "High",
-            "medium": "Medium",
-            "low": "Low",
-        }
-        SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-
-        HEADERS = [
-            "Manifest Path", "Dependency", "Ecosystem", "Scope", "Relationship",
-            "CVE ID", "GHSA ID", "Summary", "Severity",
-            "CVSS Score", "Vulnerable Range", "First Patched Version", "Alert Link",
-        ]
-
-        def clean(value):
-            text = str(value) if value is not None else "N/A"
-            return text.replace("|", "\\|").replace("\n", " ").strip() or "N/A"
-
-        def cvss_score(advisory):
-            severities = advisory.get("cvss_severities") or {}
-            v4_score = (severities.get("cvss_v4") or {}).get("score")
-            if v4_score:
-                return f"{v4_score:.1f} (v4)"
-
-            v3_score = (severities.get("cvss_v3") or {}).get("score")
-            if v3_score is not None:
-                return f"{v3_score:.1f} (v3)"
-
-            legacy_score = (advisory.get("cvss") or {}).get("score")
-            if legacy_score is not None:
-                return f"{legacy_score:.1f} (v3)"
-
-            return "N/A"
-
-        def row_for(alert):
-            dependency = alert.get("dependency") or {}
-            package = dependency.get("package") or {}
-            advisory = alert.get("security_advisory") or {}
-            vulnerability = alert.get("security_vulnerability") or {}
-            first_patched = (vulnerability.get("first_patched_version") or {}).get("identifier")
-
-            return [
-                dependency.get("manifest_path"),
-                package.get("name"),
-                package.get("ecosystem"),
-                dependency.get("scope"),
-                dependency.get("relationship"),
-                advisory.get("cve_id"),
-                advisory.get("ghsa_id"),
-                advisory.get("summary"),
-                SEV_EMOJI.get((vulnerability.get("severity") or "").lower(), vulnerability.get("severity", "Unknown")),
-                cvss_score(advisory),
-                vulnerability.get("vulnerable_version_range"),
-                first_patched,
-                alert.get("html_url"),
-            ]
-
-        lines = [
-            "## 🔍 Scan Agent — Dependabot Alert Report",
-            "",
-            f"**Total open alerts found:** {len(alerts)}",
-            "",
-        ]
-
-        if not alerts:
-            lines.append("_No open Dependabot alerts were found for this repository._")
-        else:
-            lines.append("| " + " | ".join(HEADERS) + " |")
-            lines.append("|" + "---|" * len(HEADERS))
-
-            alerts_sorted = sorted(
-                alerts,
-                key=lambda a: SEV_RANK.get(((a.get("security_vulnerability") or {}).get("severity", "")).lower(), 4),
-            )
-            for alert in alerts_sorted:
-                cells = [clean(v) for v in row_for(alert)]
-                lines.append("| " + " | ".join(cells) + " |")
-
-        content = "\n".join(lines) + "\n"
-        open(dst, "w").write(content)
-        print(content)
-        PYEOF
-
+        python3 "${{ github.action_path }}/scan_summary.py" "$PWD/dependabot-raw.json" "$PWD/scan-summary.md"
         cat scan-summary.md >> "$GITHUB_STEP_SUMMARY"
+
 
     - name: Upload raw alerts artifact
       uses: actions/upload-artifact@v4
@@ -145,6 +47,7 @@ runs:
         name: dependabot-raw
         path: dependabot-raw.json
         retention-days: 14
+
 
     - name: Upload scan summary artifact
       uses: actions/upload-artifact@v4
