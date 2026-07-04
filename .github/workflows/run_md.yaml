@@ -1,0 +1,56 @@
+name: Compile and Run ABC Agentic Workflow
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ABC.md'
+
+permissions:
+  contents: write   # needed to commit the compiled lock file
+  issues: write      # needed by the agent's safe-output (create-issue)
+  actions: write     # needed to dispatch the compiled workflow
+
+jobs:
+  compile-and-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gh-aw CLI extension
+        run: gh extension install github/gh-aw
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Turns .github/workflows/ABC.md into .github/workflows/ABC.lock.yml
+      # (validated, security-scanned, hardened GitHub Actions YAML)
+      - name: Compile ABC.md into ABC.lock.yml
+        run: gh aw compile .github/workflows/ABC.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The compiled lock file must exist on the branch before it can be
+      # dispatched, so commit it back to the repo.
+      - name: Commit compiled lock file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/ABC.lock.yml
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: recompile ABC.md -> ABC.lock.yml [skip ci]"
+            git push
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Triggers a workflow_dispatch run of the freshly compiled workflow.
+      - name: Run the compiled agentic workflow
+        run: gh aw run ABC
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
