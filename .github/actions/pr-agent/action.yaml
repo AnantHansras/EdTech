@@ -1,0 +1,12 @@
+name: "PR Agent"
+description: "Placeholder PR Agent"
+
+runs:
+  using: "composite"
+  steps:
+    - name: PR Agent
+      shell: bash
+      run: |
+        echo "📬 PR Agent started..."
+        echo "Creating pull request (placeholder)..."
+        echo "✅ PR Agent completed."
