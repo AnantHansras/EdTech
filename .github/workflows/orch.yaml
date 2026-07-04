@@ -22,6 +22,7 @@ jobs:
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
 
+
   triage-agent:
     name: "🧭 Triage Agent"
     needs: scan-agent
@@ -35,6 +36,7 @@ jobs:
       - name: Run Triage Agent
         uses: ./.github/actions/triage-agent
 
+
   remediation-agent:
     name: "🛠️ Remediation Agent"
     needs: triage-agent
@@ -47,3 +49,31 @@ jobs:
 
       - name: Run Remediation Agent
         uses: ./.github/actions/remediation-agent
+  
+  validation-agent:
+    name: "✅ Validation Agent"
+    needs: remediation-agent
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Validation Agent
+        uses: ./.github/actions/validation-agent
+
+
+  pr-agent:
+    name: "📬 PR Agent"
+    needs: validation-agent
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run PR Agent
+        uses: ./.github/actions/pr-agent  
