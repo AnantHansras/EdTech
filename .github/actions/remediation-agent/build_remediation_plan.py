@@ -1,46 +1,14 @@
-#!/usr/bin/env python3
-"""
-Remediation Agent scoring engine.
-
-Groups Dependabot alerts by dependency component. Each component may have
-several open CVEs, each tied to its own `first_patched_version` and
-`vulnerable_version_range`. A component can therefore have multiple distinct
-"fixed version" candidates (e.g. nodemailer 8.0.8 and 8.0.9).
-
-Naively scoring each candidate version only by the CVEs whose own
-first_patched_version equals it undercounts what upgrading actually buys you:
-a higher version typically also resolves CVEs that were already patched at a
-lower version. So instead, for every candidate fixed version V of a
-component, we use `vulnerable_version_range` to determine how many of *all*
-that component's CVEs V actually resolves (i.e. V falls outside the CVE's
-vulnerable range), and score V on that cumulative set:
-
-    score(V) = sum(SEVERITY_WEIGHT[severity] for each CVE V resolves)
-
-Fixed versions are ordered in the response (highest first) by:
-    (-score, -number_of_cves_resolved, version string ascending)
-
-The `fixed_version` and `fix_summary` fields keep their original meaning —
-each entry still only *lists* the CVEs whose own first_patched_version is
-exactly that version — only the ORDER of the entries changes based on the
-cumulative scoring above. No affected/vulnerable-range text is included in
-the output.
-
-Only alerts that are currently "open" AND have a known first_patched_version
-are considered — an alert with no available fix cannot contribute to a
-remediation recommendation.
-"""
-
 import json
 import re
 import sys
 from collections import defaultdict
 
+
 SEVERITY_WEIGHT = {
-    "critical": 4,
-    "high": 3,
-    "medium": 2,
-    "low": 1,
+    "critical": 2,
+    "high": 1,
+    "medium": 0,
+    "low": 0,
 }
 
 
@@ -49,28 +17,48 @@ def severity_weight(severity: str) -> int:
 
 
 def load_alerts(path: str):
+    """
+    Read the input JSON file containing Dependabot alerts.
+
+    Example:
+        alerts = load_alerts("alerts.json")
+
+    Returns:
+        A Python list of alert dictionaries.
+    """
     with open(path) as f:
         return json.load(f)
 
 
-# ---------------------------------------------------------------------------
-# Minimal version comparison + range parsing.
-#
-# Versions are dotted numeric strings ("8.0.8", "4.0.6"). Ranges look like
-# "<= 8.0.8", "< 4.0.6", ">= 4.0.0, < 4.0.6". This is intentionally simple
-# (no pre-release/build-metadata handling) since Dependabot's
-# vulnerable_version_range strings for npm/most ecosystems fit this shape.
-# ---------------------------------------------------------------------------
-
 def parse_version(v: str):
+    """
+    Convert a version string into a tuple of numbers.
+
+    Example:
+        "2.5.1" -> (2, 5, 1)
+        "1.0-beta" -> (1, 0, 0)
+
+    This makes version comparison easier.
+    """
     parts = []
-    for chunk in re.split(r"[.\-+]", v.strip()):
+    for chunk in re.split(r"[-.+]", v.strip()):
         m = re.match(r"\d+", chunk)
         parts.append(int(m.group()) if m else 0)
     return tuple(parts)
 
 
 def compare_versions(v1: str, v2: str) -> int:
+    """
+    Compare two version numbers.
+
+    Returns:
+        -1 if v1 < v2
+         0 if equal
+         1 if v1 > v2
+
+    Example:
+        compare_versions("1.2", "1.3") -> -1
+    """
     p1, p2 = parse_version(v1), parse_version(v2)
     length = max(len(p1), len(p2))
     p1 = p1 + (0,) * (length - len(p1))
@@ -86,6 +74,15 @@ _OPS = (">=", "<=", ">", "<", "=")
 
 
 def parse_constraints(range_str: str):
+    """
+    Split a vulnerable version range into individual conditions.
+
+    Example:
+        ">=1.0,<2.0"
+
+    becomes:
+        [('>=','1.0'),('<','2.0')]
+    """
     constraints = []
     for part in (range_str or "").split(","):
         part = part.strip()
@@ -99,12 +96,22 @@ def parse_constraints(range_str: str):
 
 
 def version_satisfies_range(version: str, range_str: str) -> bool:
-    """True if `version` falls inside the vulnerable range (i.e. is still vulnerable)."""
+    """
+    Check whether a version falls inside a vulnerable version range.
+
+    Example:
+        version="1.5"
+        range=">=1.0,<2.0"
+
+        Returns True.
+    """
     constraints = parse_constraints(range_str)
     if not constraints:
         return False
+
     for op, bound in constraints:
         cmp = compare_versions(version, bound)
+
         if op == ">=" and not (cmp >= 0):
             return False
         if op == "<=" and not (cmp <= 0):
@@ -115,31 +122,74 @@ def version_satisfies_range(version: str, range_str: str) -> bool:
             return False
         if op == "=" and not (cmp == 0):
             return False
+
     return True
 
 
-def resolves_cve(candidate_version: str, cve_patched_version: str, cve_range: str):
+def resolves_cve(candidate_version: str,
+                 cve_patched_version: str,
+                 cve_range: str):
     """
-    Does upgrading to `candidate_version` resolve a CVE whose own fix is
-    `cve_patched_version` / vulnerable range `cve_range`?
+    Check whether a candidate version fixes a CVE.
 
-    Preferred check: candidate_version is outside the vulnerable range.
-    Falls back to plain version comparison if the range is missing/unparseable.
-    """
-    if cve_range:
-        constraints = parse_constraints(cve_range)
-        if constraints:
-            return not version_satisfies_range(candidate_version, cve_range)
-    # Fallback: no usable range, just compare against the CVE's own fixed version.
-    return compare_versions(candidate_version, cve_patched_version) >= 0
+    A version fixes the CVE only if:
+    1. It is outside the vulnerable version range.
+    2. It is greater than or equal to the first patched version.
 
+    Example:
+        Candidate = 2.1
+        Patched = 2.0
+        Vulnerable range = >=1.0,<2.0
 
-# ---------------------------------------------------------------------------
-# Alert grouping
-# ---------------------------------------------------------------------------
+        Returns True.
+    """ 
+
+    not_vulnerable_by_range = True
+
+    constraints = parse_constraints(cve_range) if cve_range else []
+
+    if constraints:
+        not_vulnerable_by_range = not version_satisfies_range(
+            candidate_version,
+            cve_range,
+        )
+
+    at_or_above_patched = (
+        compare_versions(candidate_version, cve_patched_version) >= 0
+    )
+
+    return not_vulnerable_by_range and at_or_above_patched
+
 
 def group_by_component(alerts):
-    """component -> list of (cve_id, severity, patched_version, affected_range)"""
+    """
+    Group all open alerts by dependency.
+
+    Each dependency stores:
+    - CVE id
+    - Severity
+    - First patched version
+    - Vulnerable range
+    - Ecosystem
+
+    Example:
+         "commons-io": [
+                (
+                    "CVE-2024-1111",
+                    "critical",
+                    "2.16.1",
+                    "<2.16.1",
+                    "maven"
+                ),
+                (
+                    "CVE-2024-2222",
+                    "high",
+                    "2.17.0",
+                    "<2.17.0",
+                    "maven"
+                )
+            ],
+    """
     components = defaultdict(list)
 
     for alert in alerts:
@@ -149,68 +199,105 @@ def group_by_component(alerts):
         dependency = alert.get("dependency") or {}
         package = dependency.get("package") or {}
         component = package.get("name")
+        ecosystem = package.get("ecosystem")
+
         if not component:
             continue
 
         vuln = alert.get("security_vulnerability") or {}
         patched = vuln.get("first_patched_version") or {}
         fixed_version = patched.get("identifier")
+
         if not fixed_version:
-            # No fix currently available for this alert; nothing to recommend.
             continue
 
-        severity = vuln.get("severity") or (alert.get("security_advisory") or {}).get("severity", "")
+        severity = (
+            vuln.get("severity")
+            or (alert.get("security_advisory") or {}).get("severity", "")
+        )
+
         affected_range = vuln.get("vulnerable_version_range") or ""
 
         advisory = alert.get("security_advisory") or {}
-        cve_id = advisory.get("cve_id") or advisory.get("ghsa_id") or f"alert-{alert.get('number', 'unknown')}"
 
-        components[component].append((cve_id, severity, fixed_version, affected_range))
+        cve_id = (
+            advisory.get("cve_id")
+            or advisory.get("ghsa_id")
+            or f"alert-{alert.get('number', 'unknown')}"
+        )
+
+        components[component].append(
+            (
+                cve_id,
+                severity,
+                fixed_version,
+                affected_range,
+                ecosystem,
+            )
+        )
 
     return components
 
 
 def build_plan(components):
+    """
+    Build the remediation plan.
+
+    Steps:
+    1. Collect candidate fixed versions.
+    2. Check which CVEs each version fixes.
+    3. Calculate a score.
+    4. Rank versions.
+    5. Create the final JSON output.
+
+    Example:
+        If version 2.9 fixes more critical CVEs than 2.7,
+        then 2.9 is ranked first.
+    """
     plan = []
 
     for component, cves in components.items():
-        candidate_versions = sorted({v for (_, _, v, _) in cves})
-
-        # For every candidate fixed version, work out the *cumulative* set of
-        # CVEs it resolves (using affected_version_range), and score that set.
+        candidate_versions = sorted({v for (_, _, v, _, _) in cves})
         version_stats = {}
+
         for candidate in candidate_versions:
             resolved = [
                 (cve_id, severity)
-                for (cve_id, severity, patched_version, affected_range) in cves
+                for (cve_id, severity, patched_version, affected_range, ecosystem) in cves
                 if resolves_cve(candidate, patched_version, affected_range)
             ]
+
             version_stats[candidate] = {
                 "score": sum(severity_weight(sev) for _, sev in resolved),
                 "count": len(resolved),
+                "resolved": resolved,
             }
 
-        # Order candidate versions: highest cumulative score first, then most
-        # CVEs resolved, then version string ascending (deterministic tie-break).
         ranked_versions = sorted(
             candidate_versions,
             key=lambda v: (-version_stats[v]["score"], -version_stats[v]["count"], v),
         )
 
-        # Direct mapping: which CVEs are *listed* under each version in the
-        # response (only those whose own first_patched_version is that version).
-        direct_cves_by_version = defaultdict(list)
-        for (cve_id, severity, patched_version, _affected_range) in cves:
-            direct_cves_by_version[patched_version].append((cve_id, severity))
-
         version_strings = []
         summary_strings = []
 
         for version in ranked_versions:
-            direct = direct_cves_by_version.get(version, [])
-            ranked_direct = sorted(direct, key=lambda c: (-severity_weight(c[1]), c[0]))
-            cve_fragments = [f"{cve_id}({severity.lower()})" for cve_id, severity in ranked_direct]
-            summary = "This pr fixes following vulnerabilities " + ", ".join(cve_fragments)
+            resolved = version_stats[version]["resolved"]
+
+            ranked_resolved = sorted(
+                resolved,
+                key=lambda c: (-severity_weight(c[1]), c[0])
+            )
+
+            cve_fragments = [
+                f"{cve_id}({severity.lower()})"
+                for cve_id, severity in ranked_resolved
+            ]
+
+            summary = (
+                "This pr fixes following vulnerabilities : "
+                + ", ".join(cve_fragments)
+            )
 
             version_strings.append(version)
             summary_strings.append(summary)
@@ -220,17 +307,33 @@ def build_plan(components):
                 "component": component,
                 "fixed_version": "|".join(version_strings),
                 "fix_summary": "|".join(summary_strings),
+                "ecosystem": components[component][0][4],
             }
         )
 
-    # Deterministic top-level ordering by component name.
     plan.sort(key=lambda entry: entry["component"])
     return plan
 
-
 def main():
+    """
+    Run the complete remediation planning process.
+
+    Steps:
+    1. Read command-line arguments.
+    2. Load alerts.
+    3. Group alerts by dependency.
+    4. Build the remediation plan.
+    5. Save the output JSON.
+
+    Example:
+        python build_remediation_plan.py alerts.json plan.json
+    """
+
     if len(sys.argv) != 3:
-        print("Usage: build_remediation_plan.py <input_raw_json> <output_plan_json>", file=sys.stderr)
+        print(
+            "Usage: build_remediation_plan.py <input_raw_json> <output_plan_json>",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     src, dst = sys.argv[1], sys.argv[2]
@@ -242,7 +345,11 @@ def main():
     with open(dst, "w") as f:
         json.dump(plan, f, indent=2)
 
-    print(f"Remediation plan written to {dst}: {len(plan)} component(s), {len(alerts)} alert(s) considered.")
+    print(
+        f"Remediation plan written to {dst}: "
+        f"{len(plan)} component(s), "
+        f"{len(alerts)} alert(s) considered."
+    )
 
 
 if __name__ == "__main__":
