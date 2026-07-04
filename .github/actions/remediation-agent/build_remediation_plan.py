@@ -191,6 +191,7 @@ def group_by_component(alerts):
             ],
     """
     components = defaultdict(list)
+    seen_cves = defaultdict(set)
 
     for alert in alerts:
         if alert.get("state") != "open":
@@ -226,6 +227,11 @@ def group_by_component(alerts):
             or f"alert-{alert.get('number', 'unknown')}"
         )
 
+        if cve_id in seen_cves[component]:
+            continue
+
+        seen_cves[component].add(cve_id)
+        
         components[component].append(
             (
                 cve_id,
