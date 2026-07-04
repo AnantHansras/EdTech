@@ -53,8 +53,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
 
-      # Triggers a workflow_dispatch run of the freshly compiled workflow.
+      # GitHub needs a short moment to index a workflow file that was just
+      # pushed in this same job before it's dispatchable via the API, so
+      # retry for a bit instead of failing on the first attempt.
       - name: Run the compiled agentic workflow
-        run: gh aw run ABC
+        run: |
+          for i in $(seq 1 10); do
+            if gh aw run ABC; then
+              exit 0
+            fi
+            echo "Workflow not indexed yet, retrying in 6s... ($i/10)"
+            sleep 6
+          done
+          echo "gh aw run ABC failed after retries"
+          exit 1
         env:
           GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
