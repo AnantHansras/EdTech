@@ -39,7 +39,7 @@ SEV_EMOJI = {
 SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 HEADERS = [
-    "Manifest Path", "Dependency", "Ecosystem", "Scope", "Relationship",
+    "Manifest Path", "Dependency", "Ecosystem",
     "CVE ID", "GHSA ID", "Summary", "Severity",
     "CVSS Score", "Vulnerable Range", "First Patched Version", "Alert Link",
 ]
@@ -75,8 +75,6 @@ def row_for(alert):
         dependency.get("manifest_path"),
         package.get("name"),
         package.get("ecosystem"),
-        dependency.get("scope"),
-        dependency.get("relationship"),
         advisory.get("cve_id"),
         advisory.get("ghsa_id"),
         advisory.get("summary"),
@@ -84,7 +82,7 @@ def row_for(alert):
         cvss_score(advisory),
         vulnerability.get("vulnerable_version_range"),
         first_patched,
-        alert.get("html_url"),
+        f"[Link]({alert.get('html_url')})",
     ]
 
 lines = [
