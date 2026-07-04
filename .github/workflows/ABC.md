@@ -7,6 +7,8 @@ permissions:
   copilot-requests: write
 
 
+model: claude-opus-4.8
+
 safe-outputs:
   create-issue:
     title-prefix: "[ABC] "
