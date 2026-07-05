@@ -1,240 +1,48 @@
 name: 'Triage Agent'
-description: 'Downloads the raw Dependabot alert data, groups alerts by component, and produces a severity + repo-usage + dependency-centrality sorted Job Summary. Produces no artifacts.'
+description: >
+  Downloads raw Dependabot alerts, groups them by component, scans the
+  repository to determine dependency usage and centrality, ranks the
+  affected components, and publishes a Job Summary. Produces no artifacts.
+
 runs:
   using: 'composite'
   steps:
+
     - name: Download raw alerts artifact
       uses: actions/download-artifact@v4
       with:
         name: dependabot-raw
         path: .
+  
 
-    - name: Generate component-grouped Job Summary
+    - name: Group alerts by component
       shell: bash
       run: |
-        set -euo pipefail
-        python3 - "$PWD/dependabot-raw.json" "$GITHUB_WORKSPACE" <<'PYEOF'
-        import json
-        import os
-        import re
-        import sys
-        from collections import defaultdict
+        python3 "${{ github.action_path }}/scripts/parse_alerts.py" \
+          "$PWD/dependabot-raw.json" \
+          "$PWD/components.json"
 
-        src, repo_root = sys.argv[1], sys.argv[2]
 
-        with open(src) as f:
-            alerts = json.load(f)
+    - name: Scan repo for usage count
+      shell: bash
+      run: |
+        python3 "${{ github.action_path }}/scripts/scan_repo.py" \
+          "$PWD/components.json" \
+          "$GITHUB_WORKSPACE" \
+          "$PWD/repo_scan.json"
+    
+    
+    - name: Scan Dependencies 
+      shell: bash
+      run: |
+        python3 "${{ github.action_path }}/scripts/scan_dep.py" \
+          "$PWD/repo_scan.json" \
+          "$GITHUB_WORKSPACE" \
+          "$PWD/dependency_scan.json"
 
-        # -------------------------------------------------------------
-        # Group raw alerts by component (dependency package name)
-        # -------------------------------------------------------------
-        SEVERITY_LEVELS = ("critical", "high", "medium", "low")
 
-        components = defaultdict(lambda: {
-            "cves": set(),
-            "fixed_versions": set(),
-            "sev_counts": {level: 0 for level in SEVERITY_LEVELS},
-        })
-
-        for alert in alerts:
-            dependency = alert.get("dependency") or {}
-            package = dependency.get("package") or {}
-            component = package.get("name")
-            if not component:
-                continue
-
-            advisory = alert.get("security_advisory") or {}
-            vuln = alert.get("security_vulnerability") or {}
-
-            cve_id = advisory.get("cve_id") or advisory.get("ghsa_id") or f"alert-{alert.get('number', 'unknown')}"
-            severity = (vuln.get("severity") or advisory.get("severity") or "unknown").lower()
-
-            patched = vuln.get("first_patched_version") or {}
-            fixed_version = patched.get("identifier")
-
-            entry = components[component]
-            entry["cves"].add(cve_id)
-            if fixed_version:
-                entry["fixed_versions"].add(fixed_version)
-
-            if severity in entry["sev_counts"]:
-                entry["sev_counts"][severity] += 1
-
-        # -------------------------------------------------------------
-        # Walk the repo once to build the source-file inventory.
-        # -------------------------------------------------------------
-        SKIP_DIRS = {".git", "node_modules", "dist", "build", "vendor", ".venv", "venv", "__pycache__"}
-        SOURCE_EXT = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".go", ".rb", ".java", ".php"}
-        RESOLVABLE_EXT = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py"]
-
-        source_files = []
-        for dirpath, dirnames, filenames in os.walk(repo_root):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
-            for fname in filenames:
-                if os.path.splitext(fname)[1] in SOURCE_EXT:
-                    source_files.append(os.path.join(dirpath, fname))
-
-        total_files = len(source_files)
-
-        file_contents = {}
-        for path in source_files:
-            try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                    file_contents[path] = fh.read()
-            except OSError:
-                file_contents[path] = ""
-
-        # -------------------------------------------------------------
-        # Build the *internal* module dependency graph (which repo
-        # files import which other repo files) so we can measure
-        # "dependency centrality": how many other internal modules
-        # transitively rely on a file that pulls in a vulnerable
-        # component. A file with many internal dependents that also
-        # imports a flagged package raises that package's blast radius.
-        # -------------------------------------------------------------
-        RELATIVE_IMPORT_RE = re.compile(
-            r"""(?:require\(\s*['"](?P<req>\.{1,2}/[^'"]*)['"]\s*\))"""
-            r"""|(?:from\s+['"](?P<esfrom>\.{1,2}/[^'"]*)['"])"""
-            r"""|(?:import\s+['"](?P<esimport>\.{1,2}/[^'"]*)['"])"""
-            r"""|(?:^\s*from\s+(?P<pyfrom>\.+[a-zA-Z0-9_.]*)\s+import)"""
-        )
-
-        def resolve_js_like(base_dir, rel_path):
-            candidate = os.path.normpath(os.path.join(base_dir, rel_path))
-            if os.path.isfile(candidate):
-                return candidate
-            for ext in RESOLVABLE_EXT:
-                if os.path.isfile(candidate + ext):
-                    return candidate + ext
-            for ext in RESOLVABLE_EXT:
-                index_candidate = os.path.join(candidate, "index" + ext)
-                if os.path.isfile(index_candidate):
-                    return index_candidate
-            return None
-
-        def resolve_py_relative(base_dir, dotted):
-            # Count leading dots to know how many directories to walk up.
-            depth = len(dotted) - len(dotted.lstrip("."))
-            remainder = dotted[depth:]
-            target_dir = base_dir
-            for _ in range(depth - 1):
-                target_dir = os.path.dirname(target_dir)
-            if not remainder:
-                return None
-            parts = remainder.split(".")
-            candidate = os.path.normpath(os.path.join(target_dir, *parts))
-            if os.path.isfile(candidate + ".py"):
-                return candidate + ".py"
-            init_candidate = os.path.join(candidate, "__init__.py")
-            if os.path.isfile(init_candidate):
-                return init_candidate
-            return None
-
-        # dependents[file] = set of internal files that import `file`
-        dependents = defaultdict(set)
-
-        for path in source_files:
-            base_dir = os.path.dirname(path)
-            content = file_contents[path]
-            for m in RELATIVE_IMPORT_RE.finditer(content):
-                target = None
-                if m.group("req"):
-                    target = resolve_js_like(base_dir, m.group("req"))
-                elif m.group("esfrom"):
-                    target = resolve_js_like(base_dir, m.group("esfrom"))
-                elif m.group("esimport"):
-                    target = resolve_js_like(base_dir, m.group("esimport"))
-                elif m.group("pyfrom"):
-                    target = resolve_py_relative(base_dir, m.group("pyfrom"))
-                if target and target != path:
-                    dependents[target].add(path)
-
-        # Internal in-degree = how many distinct internal modules depend on this file.
-        internal_in_degree = {path: len(dependents.get(path, ())) for path in source_files}
-
-        # -------------------------------------------------------------
-        # Compute, per vulnerable component:
-        #   - file_count: how many source files import the component directly
-        #   - centrality: sum of internal in-degree across those importing
-        #     files, i.e. how deeply embedded those consumers are in the
-        #     codebase's own internal dependency graph
-        # -------------------------------------------------------------
-        def usage_files(component):
-            pattern = re.compile(
-                r"""(require\(\s*['"]""" + re.escape(component) + r"""(/[^'"]*)?['"]\s*\))"""
-                r"""|(from\s+['"]""" + re.escape(component) + r"""(/[^'"]*)?['"])"""
-                r"""|(import\s+['"]""" + re.escape(component) + r"""(/[^'"]*)?['"])"""
-                r"""|(^\s*(import|from)\s+""" + re.escape(component.replace("-", "_")) + r"""\b)"""
-            )
-            matches = []
-            for path in source_files:
-                if pattern.search(file_contents[path]):
-                    matches.append(path)
-            return matches
-
-        rows = []
-        for component, data in components.items():
-            files_using = usage_files(component)
-            file_count = len(files_using)
-            centrality = sum(internal_in_degree.get(f, 0) for f in files_using)
-            sev_counts = data["sev_counts"]
-            rows.append({
-                "component": component,
-                "cves": sorted(data["cves"]),
-                "fixed_versions": sorted(data["fixed_versions"]),
-                "sev_counts": sev_counts,
-                "critical_high_count": sev_counts["critical"] + sev_counts["high"],
-                "file_count": file_count,
-                "centrality": centrality,
-            })
-
-        # Sort priority:
-        #   1. highest combined critical+high severity count
-        #   2. highest dependency centrality (blast radius across the
-        #      internal module graph)
-        #   3. highest raw file-usage count
-        #   4. component name ascending, for determinism
-        rows.sort(key=lambda r: (-r["critical_high_count"], -r["centrality"], -r["file_count"], r["component"]))
-
-        # -------------------------------------------------------------
-        # Render Job Summary
-        # -------------------------------------------------------------
-        lines = []
-        lines.append("## 🧭 Triage Agent — Alerts Grouped by Component")
-        lines.append("")
-        lines.append(f"**Total alerts triaged:** {len(alerts)}  ")
-        lines.append(f"**Distinct components:** {len(rows)}  ")
-        lines.append(f"**Source files scanned:** {total_files}")
-        lines.append("")
-
-        if not rows:
-            lines.append("_No alerts to triage._")
-        else:
-            lines.append(
-                f"Sorted by combined Critical+High count, then by Dependency Centrality "
-                f"(sum of internal in-degree across the files that import the component), "
-                f"then by number of files (out of {total_files}) that use the component."
-            )
-            lines.append("")
-            lines.append("| Rank | Component | 🔴 Critical | 🟠 High | 🟡 Medium | 🟢 Low | Dependency Centrality | Used In Files | CVE / GHSA IDs | Fixed Versions |")
-            lines.append("|---|---|---|---|---|---|---|---|---|---|")
-            for rank, row in enumerate(rows, start=1):
-                sc = row["sev_counts"]
-                usage = f"{row['file_count']}/{total_files}"
-                cve_list = ", ".join(f"`{c}`" for c in row["cves"]) or "N/A"
-                fixed_list = ", ".join(f"`{v}`" for v in row["fixed_versions"]) or "N/A"
-                lines.append(
-                    f"| {rank} | `{row['component']}` | {sc['critical']} | {sc['high']} | {sc['medium']} | {sc['low']} "
-                    f"| {row['centrality']} | {usage} | {cve_list} | {fixed_list} |"
-                )
-
-        content = "\n".join(lines) + "\n"
-
-        step_summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-        if step_summary_path:
-            with open(step_summary_path, "a") as f:
-                f.write(content)
-
-        print(content)
-        PYEOF
-        # NOTE: This job intentionally uploads no artifacts, per spec.
+    - name: Publish Job Summary
+      shell: bash
+      run: |
+        python3 "${{ github.action_path }}/scripts/render_summary.py" \
+          "$PWD/dependency_scan.json"
