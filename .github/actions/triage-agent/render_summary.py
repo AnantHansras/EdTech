@@ -31,7 +31,7 @@ SEVERITY_WEIGHTS = {
 # base score, and how widely-used/central a component is can only nudge
 # it up within a known range -- it can never flip the ranking on its own.
 LEVEL_THRESHOLDS = {
-    "Very High": 0.75,  # top 25%
+    "Very High": 0.70,  # top 30%
     "High": 0.50,       # top 50%
     "Medium": 0.25,      # top 75%
     # anything below 0.25 -> "Low"
@@ -160,10 +160,10 @@ def render_markdown(components):
     lines.append("# 🚨 Dependency Risk Summary")
     lines.append("")
     lines.append(
-        "| Rank | Component | Ecosystem | Critical | High | Medium | Low | Usage | Centrality | Impact | Score |"
+        "| Rank | Component | Critical | High | Medium | Low | Impact |"
     )
     lines.append(
-        "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---:|---|---|---:|---:|---:|---:|"
     )
 
     for i, item in enumerate(ranked, start=1):
@@ -176,21 +176,21 @@ def render_markdown(components):
         sev = d.get("sev_count", {})
 
         lines.append(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | **{}** |".format(
+            "| {} | {} | {} | {} | {} | {} | **{}** |".format(
                 i,
                 item["name"],
                 # BUGFIX: ecosystem can be None (e.g. package.ecosystem was
                 # missing upstream); str(None) -> "None" would render
                 # literally in the table. Fall back to empty string.
-                d.get("ecosystem") or "",
+
                 sev.get("critical", 0),
                 sev.get("high", 0),
                 sev.get("medium", 0),
                 sev.get("low", 0),
-                item["usage_level"],
-                item["centrality_level"],
+    
+        
                 item["impact_level"],
-                item["score"],
+            
             )
         )
 
