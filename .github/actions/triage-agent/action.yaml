@@ -18,7 +18,7 @@ runs:
     - name: Group alerts by component
       shell: bash
       run: |
-        python3 "${{ github.action_path }}/scripts/parse_alerts.py" \
+        python3 "${{ github.action_path }}/parse_alerts.py" \
           "$PWD/dependabot-raw.json" \
           "$PWD/components.json"
 
@@ -26,7 +26,7 @@ runs:
     - name: Scan repo for usage count
       shell: bash
       run: |
-        python3 "${{ github.action_path }}/scripts/scan_repo.py" \
+        python3 "${{ github.action_path }}/scan_repo.py" \
           "$PWD/components.json" \
           "$GITHUB_WORKSPACE" \
           "$PWD/repo_scan.json"
@@ -35,7 +35,7 @@ runs:
     - name: Scan Dependencies 
       shell: bash
       run: |
-        python3 "${{ github.action_path }}/scripts/scan_dep.py" \
+        python3 "${{ github.action_path }}/scan_dep.py" \
           "$PWD/repo_scan.json" \
           "$GITHUB_WORKSPACE" \
           "$PWD/dependency_scan.json"
@@ -44,5 +44,5 @@ runs:
     - name: Publish Job Summary
       shell: bash
       run: |
-        python3 "${{ github.action_path }}/scripts/render_summary.py" \
+        python3 "${{ github.action_path }}/render_summary.py" \
           "$PWD/dependency_scan.json"
