@@ -10,7 +10,6 @@ Usage:
     python3 scan_dep.py <repo_scan.json> <repo_path> <dependency_scan.json>
 """
 
-import importlib.metadata as importlib_metadata
 import json
 import os
 import re
@@ -136,30 +135,27 @@ def _load_npm_edges(repo_path):
     return edges
 
 
-def _load_pip_edges_from_environment():
+def _load_requirements_edges(repo_path):
     """
-    Builds a direct-dependency graph from the currently running Python
-    environment's installed distributions, using each one's Requires-Dist
-    metadata. Reflects packages actually installed in this job, e.g. after
-    a prior `pip install -r requirements.txt` step in the same CI run.
+    Parses requirements.txt into a graph containing only top-level
+    dependencies. Since requirements.txt does not record transitive
+    dependencies, each package is mapped to an empty dependency set.
+    """
+    req_path = _find_file(repo_path, "requirements.txt")
+    if req_path is None:
+        return {}
 
-    Sample output:
-        {"requests": {"certifi", "charset-normalizer", "idna", "urllib3"}}
-    """
     edges = {}
-    for dist in importlib_metadata.distributions():
-        try:
-            name = _normalize_pip_name(dist.metadata["Name"])
-        except Exception:
-            continue
 
-        deps = set()
-        for req in dist.requires or []:
-            dep_name = re.split(r"[\s\[;<>=!~]", req, 1)[0].strip()
-            if dep_name:
-                deps.add(_normalize_pip_name(dep_name))
+    with open(req_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
 
-        edges[name] = deps
+            name = re.split(r"[<>=!~\[\s]", line, 1)[0].strip()
+            if name:
+                edges[_normalize_pip_name(name)] = set()
 
     return edges
 
@@ -199,21 +195,15 @@ def _load_poetry_lock_edges(repo_path):
 
 def _load_pip_edges(repo_path):
     """
-    Builds a pip direct-dependency graph, preferring the currently
-    installed environment (the most accurate reflection of what's actually
-    resolved), and falling back to poetry.lock if the environment has no
-    installed distributions to inspect. Returns None (not an empty dict)
-    if neither source has any data, so callers can distinguish "we
-    verified zero dependents" from "we had nothing to check against."
-
-    Sample output:
-        {"requests": {"certifi", "charset-normalizer", "idna", "urllib3"}}
+    Builds a pip dependency graph using repository files only.
+    Prefers poetry.lock, then falls back to requirements.txt.
+    Returns None if neither source is available.
     """
-    edges = _load_pip_edges_from_environment()
+    edges = _load_poetry_lock_edges(repo_path)
     if edges:
         return edges
 
-    edges = _load_poetry_lock_edges(repo_path)
+    edges = _load_requirements_edges(repo_path)
     if edges:
         return edges
 
