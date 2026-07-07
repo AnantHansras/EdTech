@@ -10,51 +10,62 @@ jobs:
   create-jira-ticket:
     runs-on: ubuntu-latest
     steps:
-      - name: Debug connectivity
-        env:
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-        run: |
-          echo "JIRA_BASE_URL length: ${#JIRA_BASE_URL}"
-          echo "JIRA_BASE_URL (masked): ${JIRA_BASE_URL:0:8}...${JIRA_BASE_URL: -8}"
-          curl -v --max-time 10 "${JIRA_BASE_URL}/status" || echo "Connection failed - see above"
+# - name: Login to Jira
+#   uses: atlassian/gajira-login@v3
+#   env:
+#     JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+#     JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+#     JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
 
-      - name: Create Jira Issue
-        env:
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
-        run: |
-          echo "Creating Jira ticket in project $JIRA_PROJECT_KEY..."
+# - name: Create Jira issue
+#   uses: atlassian/gajira-create@v3
+#   with:
+#     project: ${{ secrets.JIRA_PROJECT_KEY }}
+#     issuetype: Task
+#     summary: "Dummy ticket summary - automated test"
+#     description: "This is a dummy description created automatically via GitHub Actions."
 
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            "${JIRA_BASE_URL}/rest/api/2/issue" \
-            -H "Authorization: Bearer ${JIRA_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data @- <<EOF
-          {
-            "fields": {
-              "project": {
-                "key": "${JIRA_PROJECT_KEY}"
-              },
-              "summary": "Dummy ticket summary - automated test",
-              "description": "This is a dummy description created automatically via GitHub Actions workflow.",
-              "issuetype": {
-                "name": "Task"
-              }
-            }
-          }
-          EOF
-          )
 
-          HTTP_BODY=$(echo "$RESPONSE" | sed '$d')
-          HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
 
-          echo "Response body: $HTTP_BODY"
-          echo "HTTP status: $HTTP_STATUS"
 
-          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-            echo "✅ Jira ticket created successfully."
-          else
-            echo "❌ Failed to create Jira ticket."
-            exit 1
-          fi
+# - name: Install jira-cli
+#   run: |
+#     curl -LO https://github.com/ankitpokhrel/jira-cli/releases/latest/download/jira_linux_amd64.tar.gz
+#     tar -xzf jira_linux_amd64.tar.gz
+#     sudo mv jira_linux_amd64/bin/jira /usr/local/bin/
+
+# - name: Create ticket
+#   env:
+#     JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+#   run: |
+#     jira init --server ${{ secrets.JIRA_BASE_URL }} --login <email>
+#     jira issue create -p ${{ secrets.JIRA_PROJECT_KEY }} -t Task \
+#       -s "Dummy ticket summary" -b "Dummy description"
+
+
+
+
+# - name: Set up Python
+#   uses: actions/setup-python@v5
+#   with:
+#     python-version: '3.x'
+
+# - name: Create Jira ticket
+#   env:
+#     JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+#     JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+#     JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+#   run: |
+#     pip install jira
+#     python3 -c "
+#     from jira import JIRA
+#     import os
+#     jira = JIRA(server=os.environ['JIRA_BASE_URL'], token_auth=os.environ['JIRA_API_TOKEN'])
+#     issue = jira.create_issue(
+#         project=os.environ['JIRA_PROJECT_KEY'],
+#         summary='Dummy ticket summary',
+#         description='Dummy description',
+#         issuetype={'name': 'Task'}
+#     )
+#     print(f'Created: {issue.key}')
+#     "
