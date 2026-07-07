@@ -1,0 +1,52 @@
+name: Create Jira Ticket
+
+# Trigger manually from the Actions tab, or on push to main — adjust as needed
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [ main ]
+
+jobs:
+  create-jira-ticket:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Jira Issue
+        env:
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+        run: |
+          echo "Creating Jira ticket in project $JIRA_PROJECT_KEY..."
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${JIRA_BASE_URL}/rest/api/2/issue" \
+            -H "Authorization: Bearer ${JIRA_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data @- <<EOF
+          {
+            "fields": {
+              "project": {
+                "key": "${JIRA_PROJECT_KEY}"
+              },
+              "summary": "Dummy ticket summary - automated test",
+              "description": "This is a dummy description created automatically via GitHub Actions workflow.",
+              "issuetype": {
+                "name": "Task"
+              }
+            }
+          }
+          EOF
+          )
+
+          HTTP_BODY=$(echo "$RESPONSE" | sed '$d')
+          HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
+
+          echo "Response body: $HTTP_BODY"
+          echo "HTTP status: $HTTP_STATUS"
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "✅ Jira ticket created successfully."
+          else
+            echo "❌ Failed to create Jira ticket."
+            exit 1
+          fi
