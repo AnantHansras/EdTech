@@ -10,6 +10,14 @@ jobs:
   create-jira-ticket:
     runs-on: ubuntu-latest
     steps:
+      - name: Debug connectivity
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+        run: |
+          echo "JIRA_BASE_URL length: ${#JIRA_BASE_URL}"
+          echo "JIRA_BASE_URL (masked): ${JIRA_BASE_URL:0:8}...${JIRA_BASE_URL: -8}"
+          curl -v --max-time 10 "${JIRA_BASE_URL}/status" || echo "Connection failed - see above"
+
       - name: Create Jira Issue
         env:
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
